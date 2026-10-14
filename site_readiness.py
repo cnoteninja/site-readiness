@@ -8,6 +8,7 @@ Checks:
   * Local IP, gateway, DNS servers, DHCP info
   * Gateway ping + DNS resolution timing
   * Common service ports on the gateway (80/443/22/3389/9100/515/631)
+  * VoIP readiness (jitter / packet loss / estimated MOS, TCP approximation)
   * Wi-Fi survey summary (visible SSIDs, strongest APs, congestion)
   * Internet download speed
 
@@ -20,6 +21,7 @@ Zero third-party dependencies. Windows / Linux / macOS.
 import argparse
 import html
 import json
+import math
 import os
 import platform
 import re
@@ -121,6 +123,70 @@ def scan_ports(host, ports):
     return out
 
 
+# ------------------------------------------------------------------ voip --
+def voip_probe(host, port, samples=20, timeout=3):
+    """TCP-based VoIP readiness approximation, stdlib only.
+
+    Real RTP voice is UDP, and UDP jitter cannot be measured without a
+    cooperating echo server. As a documented approximation we take
+    repeated small-payload TCP round-trips (the SYN/SYN-ACK handshake
+    time on a TCP port) and estimate:
+      * latency  = mean RTT (ms)
+      * jitter   = mean absolute difference of consecutive RTTs (ms),
+                   the same mean-deviation idea as RFC 3550 jitter
+      * loss     = share of samples that failed or timed out (%)
+
+    Results feed estimate_mos() below and the VoIP report section.
+    """
+    rtts = []
+    lost = 0
+    for _ in range(samples):
+        t = time.time()
+        try:
+            s = socket.create_connection((host, port), timeout=timeout)
+            s.close()
+            rtts.append((time.time() - t) * 1000)
+        except Exception:
+            lost += 1
+    loss_pct = lost / samples * 100
+    if not rtts:
+        return {"target": "%s:%d" % (host, port), "latency_ms": None,
+                "jitter_ms": None, "loss_pct": round(loss_pct, 1),
+                "mos": None, "ok": False}
+    latency = sum(rtts) / len(rtts)
+    jitter = (sum(abs(rtts[i] - rtts[i - 1]) for i in range(1, len(rtts)))
+              / (len(rtts) - 1)) if len(rtts) > 1 else 0.0
+    mos = estimate_mos(latency + jitter, loss_pct / 100.0)
+    return {"target": "%s:%d" % (host, port),
+            "latency_ms": round(latency, 1),
+            "jitter_ms": round(jitter, 1),
+            "loss_pct": round(loss_pct, 1),
+            "mos": mos,
+            "ok": bool(jitter < 30 and loss_pct < 1 and mos >= 3.6)}
+
+
+def estimate_mos(delay_ms, loss):
+    """Estimate VoIP MOS from delay and loss using a simplified E-model
+    (ITU-T G.107) rating, then map R to MOS.
+
+    Formula (exact):
+        H = 1 if delay_ms > 177.3 else 0
+        R = 93.2 - 0.024*delay_ms - 0.11*(delay_ms - 177.3)*H
+            - 30*ln(1 + 15*loss)
+        MOS = 1 + 0.035*R + 7e-6*R*(R - 60)*(100 - R)
+
+    delay_ms is the effective one-way delay: we pass latency + jitter,
+    because a jitter buffer adds roughly the jitter amount to the
+    effective delay. loss is the loss probability 0..1.
+    MOS is clamped to the [1.0, 4.5] scale and rounded to 2 decimals.
+    """
+    H = 1.0 if delay_ms > 177.3 else 0.0
+    R = (93.2 - 0.024 * delay_ms - 0.11 * (delay_ms - 177.3) * H
+         - 30 * math.log(1 + 15 * loss))
+    mos = 1 + 0.035 * R + 7e-6 * R * (R - 60) * (100 - R)
+    return round(max(1.0, min(4.5, mos)), 2)
+
+
 # ------------------------------------------------------------------- wifi --
 def wifi_scan():
     """Lightweight visible-network scan (summary only)."""
@@ -187,6 +253,10 @@ def verdict(data):
     for d in data["dns"]:
         if not d["ok"]:
             issues.append("DNS failed for %s." % d["domain"])
+    v = data.get("voip")
+    if v and not v.get("ok"):
+        issues.append("VoIP check failed (jitter %s ms, loss %s%%, MOS %s)." % (
+            v.get("jitter_ms"), v.get("loss_pct"), v.get("mos")))
     if data["speed_mbps"] is not None and data["speed_mbps"] < 10:
         issues.append("Download speed only %s Mbps." % data["speed_mbps"])
     return issues
@@ -216,6 +286,26 @@ def build_html(data, site):
         "<tr><td>%s</td><td>%d%%</td></tr>" % (e(n["ssid"]), n["signal"])
         for n in sorted(data["wifi"], key=lambda n: n["signal"], reverse=True)[:15])
 
+    v = data.get("voip")
+    if v and v.get("latency_ms") is not None:
+        vstat = "<div class='%s'><b>VoIP: %s</b></div>" % (
+            "ok" if v["ok"] else "bad", "PASS" if v["ok"] else "FAIL")
+        voip = """%s
+<table><tr><th>Metric</th><th>Measured</th><th>Target</th></tr>
+<tr><td>Target</td><td>%s</td><td>-</td></tr>
+<tr><td>Latency (avg RTT)</td><td>%s ms</td><td>-</td></tr>
+<tr><td>Jitter</td><td>%s ms</td><td>&lt; 30 ms</td></tr>
+<tr><td>Packet loss</td><td>%s%%</td><td>&lt; 1%%</td></tr>
+<tr><td>Estimated MOS</td><td>%s</td><td>&ge; 3.6</td></tr></table>
+<p><small>Method: jitter/loss approximated from repeated small-payload TCP
+round-trips (stdlib only — no UDP echo). MOS via simplified E-model; see README.</small></p>""" % (
+            vstat, e(v["target"]), v["latency_ms"], v["jitter_ms"],
+            v["loss_pct"], v["mos"])
+    else:
+        voip = ("<div class='bad'><b>VoIP: FAIL</b></div>"
+                "<p>Target unreachable (%s).</p>" %
+                e(v["target"] if v and v.get("target") else "no route"))
+
     ts = e(data["timestamp"])
     return """<!DOCTYPE html><html><head><meta charset="utf-8">
 <title>Site Readiness — {site}</title>
@@ -236,6 +326,7 @@ th{{background:#f5f5f5}}.grid{{display:grid;grid-template-columns:1fr 1fr;gap:1e
 <tr><td>Download speed</td><td>{spd}</td></tr></table>
 <h2>DNS resolution</h2><table><tr><th>Domain</th><th>Status</th><th>Detail</th></tr>{dns}</table>
 <h2>Gateway ports</h2><table><tr><th>Port</th><th>Status</th><th>RTT</th></tr>{ports}</table>
+<h2>VoIP readiness</h2>{voip}
 <h2>Visible Wi-Fi (top 15)</h2><table><tr><th>SSID</th><th>Signal</th></tr>{wifi}</table>
 <p><small>Generated by <a href="https://github.com/cnoteninja/site-readiness">site-readiness</a></small></p>
 </body></html>""".format(
@@ -246,7 +337,7 @@ th{{background:#f5f5f5}}.grid{{display:grid;grid-template-columns:1fr 1fr;gap:1e
                                          data["gateway_ping"]["loss_pct"]) or "unreachable"),
         dns_s=e(", ".join(data["dns_servers"]) or "none"),
         spd="%s Mbps" % data["speed_mbps"] if data["speed_mbps"] else "test failed",
-        dns=dns, ports=ports, wifi=wifi or "<tr><td colspan=2>no data</td></tr>")
+        dns=dns, ports=ports, voip=voip, wifi=wifi or "<tr><td colspan=2>no data</td></tr>")
 
 
 def main():
@@ -276,6 +367,15 @@ def main():
         data["ports"] = scan_ports(gw, COMMON_PORTS)
     else:
         data["ports"] = []
+    print("checking VoIP readiness...")
+    if gw:
+        voip_host = gw
+        open_ports = [p["port"] for p in data["ports"] if p["open"]]
+        voip_port = 443 if 443 in open_ports else (
+            open_ports[0] if open_ports else 443)
+    else:
+        voip_host, voip_port = "8.8.8.8", 53  # Google Public DNS, TCP fallback
+    data["voip"] = voip_probe(voip_host, voip_port)
     print("scanning wifi...")
     data["wifi"] = wifi_scan()
     print("running speed test (~30s)...")
