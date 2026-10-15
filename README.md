@@ -19,6 +19,80 @@ python site_readiness.py --site "Client HQ - Floor 2"
 
 Open `readiness.html`. That's your handoff doc.
 
+Want to see what a finished report looks like first, with no network needed?
+
+```bash
+python site_readiness.py --demo
+```
+
+## Executive summary
+
+Every report opens with a plain-English **Executive summary** section,
+generated from the same results data as the technical detail below it:
+
+- Overall verdict: **Ready** / **Ready with caveats** / **Not ready**
+- A voice line in the form "Ready for ~N simultaneous voice calls",
+  derived from the VoIP probe (MOS band), or a plain statement that voice
+  isn't recommended until the issues are fixed
+- Internet quality described in words ("Fast", "Good", "Adequate", "Slow")
+  from the measured download speed
+- One line per check area (wall jack, router, name lookups, port scan,
+  voice calls, nearby Wi-Fi, internet speed), each in non-technical
+  language
+
+It's safe to forward to a client or manager as-is. Example (from `--demo`):
+
+> **Verdict: Ready with caveats** - Usable, but the issues below should be
+> fixed or noted before handoff.
+>
+> **Voice:** Not recommended for voice calls until the issues below are
+> fixed (estimated call quality MOS 3.12, target is 3.6+).
+>
+> **Internet:** Good (45.2 Mbps) - comfortable for typical office work.
+>
+> - ✓ **Wall jack:** The wall jack is live - this machine got IP 10.1.5.23.
+> - ✓ **Router:** The local router answers quickly (1.8 ms average, no packet loss).
+> - ! **Name lookups:** Name lookups mostly work, but cloudflare.com failed - some sites may not load.
+> - • **Port scan:** 2 of 8 common ports on the router answered (443, 9100).
+> - ✗ **Voice calls:** Voice calls will likely sound choppy or drop (estimated score 3.12 out of 5; target is 3.6+).
+> - • **Wi-Fi nearby:** 3 wireless network(s) visible; strongest is 'Client-Guest'.
+> - ✓ **Internet speed:** Good (45.2 Mbps) - comfortable for typical office work.
+
+## Remediation guidance
+
+Every FAIL or warning in the report carries a **"How to fix"** line with a
+concrete next step. The check → fix mapping lives in exactly one place -
+the `REMEDIATION` dict in `site_readiness.py`, looked up by
+`remediation_for(check_key)` - so covering a new check means adding one
+dict entry, not editing the HTML.
+
+## Demo mode
+
+```bash
+python site_readiness.py --demo
+```
+
+Builds a sample report from bundled synthetic data - a deliberate mix of
+passes and failures (healthy drop, gateway, and speed; one DNS hiccup; a
+failing VoIP probe) - so you can see the executive summary and the
+remediation lines in action. No network needed; finishes in seconds.
+Writes the usual `readiness.html` / `readiness.json` (clearly labeled
+"SYNTHETIC DATA").
+
+## Setup checker
+
+```bash
+python check_setup.py
+```
+
+Prerequisite check with plain-English `PASS` / `FAIL` / `SKIP` lines and
+no tracebacks: Python version (3.8+), `site_readiness.py` imports cleanly,
+`ping` availability, gateway reachability, DNS server reachability, the
+VoIP fallback target (8.8.8.8:53), and both speed-test hosts - all with
+short timeouts and graceful failure messages. Also confirms no config
+file or pip packages are needed (the repo uses neither). Exit code 0
+when nothing fails, 1 otherwise.
+
 ## What it checks
 
 | Check | Why it matters |
@@ -98,6 +172,7 @@ Estimated MOS    4.35   -> VoIP: PASS
 | File | Purpose |
 |---|---|
 | `site_readiness.py` | The whole tool — checks + HTML/JSON report |
+| `check_setup.py` | Prerequisite checker (PASS/FAIL lines, no tracebacks) |
 | `readiness.html` | Generated report (git-ignored) |
 | `readiness.json` | Raw results for your records (git-ignored) |
 
