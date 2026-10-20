@@ -11,6 +11,10 @@ clear READY / ISSUES verdict.
 Built for field engineers doing site surveys, office buildouts, and
 "the internet doesn't work" triage. Zero dependencies.
 
+![Site Readiness report (demo data)](demo.png)
+
+*A readiness report on demo data. Live demos: https://cnoteninja.github.io/Portfolio/*
+
 ## Quick start
 
 ```bash
